@@ -4,8 +4,7 @@ Handles UI rendering and orchestrates the workflow between user input and AI res
 """
 
 import streamlit as st
-from elevenlabs import play
-from elevenlabs.client import ElevenLabs
+from elevenlabs import generate, play
 from agent import process_user_input
 import os
 from dotenv import load_dotenv
@@ -13,50 +12,23 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# ElevenLabs client
-# ---------------------------------------------------------------------------
-
-eleven_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
-DEFAULT_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
-
 def initialize_session_state():
     """Initialize session state variables."""
     if 'conversation_history' not in st.session_state:
         st.session_state.conversation_history = []
 
-def generate_and_play_audio(text: str):
-    """Generate TTS via ElevenLabs SDK and play inside Streamlit."""
+def generate_and_play_audio(text):
+    """Generate and play audio response using ElevenLabs."""
     try:
-        # The official SDK returns raw bytes.
-        result = eleven_client.text_to_speech.convert(
+        audio = generate(
             text=text,
-            voice_id=DEFAULT_VOICE_ID,
-            model_id=DEFAULT_MODEL_ID,
-            output_format="mp3_44100_128",
+            api_key=os.getenv('ELEVENLABS_API_KEY')
         )
-        # The SDK may return bytes *or* a generator of bytes depending on size/model.
-        if isinstance(result, (bytes, bytearray)):
-            audio_bytes = result
-        else:
-            # Assume it's an iterator / generator of byte chunks
-            audio_bytes = b"".join(result)
-
-        # Persist to a deterministic path so Streamlit can reload between reruns
-        os.makedirs("audio_outputs", exist_ok=True)
+        # Save audio to file
         audio_path = "audio_outputs/response.mp3"
         with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
-
-        # Optionally play through local speakers (during dev only)
-        try:
-            play(audio_bytes)
-        except Exception:
-            # Ignore playback errors (e.g., server environment)
-            pass
-
-        # Streamlit audio component
+            f.write(audio)
+        # Play the audio
         st.audio(audio_path)
     except Exception as e:
         st.error(f"Error generating audio: {str(e)}")
