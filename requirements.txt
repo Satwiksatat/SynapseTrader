@@ -1,3 +1,7 @@
-# Python package dependencies for Synapse Trader
-pandas>=2.3.0
-anthropic>=0.60.0
+streamlit
+anthropic
+elevenlabs
+aci-sdk
+pandas
+python-dotenv
+firebolt-sdk

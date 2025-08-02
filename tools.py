@@ -6,16 +6,10 @@ Provides functions for market data access, risk assessment, and audit logging.
 import time
 import pandas as pd
 from datetime import datetime
+import time
 import json
 import os
-from typing import Dict, Any
-
-# Load the WRDS data at module level
-try:
-    df_rates = pd.read_csv("data/wrds_swap_data.csv")
-except Exception as e:
-    print(f"Error loading WRDS data: {str(e)}")
-    df_rates = pd.DataFrame()
+from firebolt_client import execute
 
 def get_client_info(client_id: str = None) -> dict:
     """
@@ -130,20 +124,135 @@ def record_trade_and_notify(client_id: str, notional_usd: float, price: float) -
     # In production, this would write to a secure audit log
     print(f"AUDIT LOG: {json.dumps(log_entry)}")
 
-def check_trading_risk(notional_usd: float) -> Dict[str, Any]:
-    """
-    Checks if a trade is within the desk's internal trading risk limits.
-    """
-    print(f"[TOOLS] Checking trading risk for notional {notional_usd:,.2f} USD...")
-    
-    # Hardcoded desk limits for the demo
-    MAX_NOTIONAL_PER_TRADE = 75_000_000.0
+# ---------------------------------------------------------------------------
+# FX Forward specific helper functions and simulated tool implementations
+# ---------------------------------------------------------------------------
 
-    if notional_usd > MAX_NOTIONAL_PER_TRADE:
-        return {
-            "status": "failure",
-            "message": f"Trade size of {notional_usd:,.2f} exceeds the desk's max trade limit of {MAX_NOTIONAL_PER_TRADE:,.2f}."
+# Try to lazily load the latest FX market snapshot.  We purposely do this at
+# import-time so that repeated calls to ``price_fx_forward`` are fast and use
+# a consistent view of the market during the demo.
+try:
+    _fx_market_df: pd.DataFrame | None = pd.read_csv("data/wrds_fx_data.csv")
+    # keep only the last (most recent) row for each currency pair
+    _fx_market_df = (
+        _fx_market_df.sort_values("Date").groupby("Pair", as_index=False).tail(1)
+    )
+except FileNotFoundError:
+    # Fallback: create a single-row DataFrame with hard-coded example rates so
+    # the demo always works even if the CSV is missing.
+    _fx_market_df = pd.DataFrame(
+        [
+            {
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "Pair": "USDGBP",
+                "SpotRate": 1.2700,
+                "3M_USD_Rate": 0.052,  # 5.2% p.a.
+                "3M_GBP_Rate": 0.047,  # 4.7% p.a.
+            }
+        ]
+    )
+
+
+def _get_latest_fx_row(pair: str) -> dict:
+    """Return the latest FX price row for the requested pair."""
+    row_match = _fx_market_df[_fx_market_df["Pair"] == pair]
+    if row_match.empty:
+        raise ValueError(f"Unsupported currency pair: {pair}")
+    return row_match.iloc[0].to_dict()
+
+
+def price_fx_forward(ccy_pair: str, notional_usd: float, tenor: str):
+    """Simulate pricing a USD/GBP FX Forward using Interest Rate Parity.
+
+    Args:
+        ccy_pair: Currently only supports "USDGBP" (base/quote order is USD/GBP)
+        notional_usd: Trade size in USD terms.
+        tenor: Forward tenor, e.g. "3M".
+
+    Returns:
+        JSON string containing the all-in forward rate, forward points and
+        contextual description.
+    """
+    if tenor.upper() != "3M":
+        raise ValueError("Only 3M tenors are supported in the MVP.")
+
+    mkt = _get_latest_fx_row(ccy_pair)
+    spot_rate = float(mkt["SpotRate"])
+    usd_rate = float(mkt["3M_USD_Rate"])
+    gbp_rate = float(mkt["3M_GBP_Rate"])
+
+    # day-count simple approximation: 90/360 = 0.25 years
+    forward_rate = spot_rate * ((1 + gbp_rate * 0.25) / (1 + usd_rate * 0.25))
+    forward_points = (forward_rate - spot_rate) * 10_000  # points in pips
+
+    # Persist market snapshot to Firebolt for analytics
+    try:
+        execute(
+            "INSERT INTO market_snaps (ts, pair, spot, usd_3m, gbp_3m) VALUES (?, ?, ?, ?, ?)",
+            [datetime.utcnow().isoformat(), ccy_pair, spot_rate, usd_rate, gbp_rate],
+        )
+    except Exception as exc:
+        print(f"Firebolt insert failed (market_snaps): {exc}")
+
+    return json.dumps(
+        {
+            "status": "success",
+            "all_in_price": round(forward_rate, 5),
+            "points": round(forward_points, 2),
+            "details": f"Quote for {notional_usd/1_000_000:.1f}mm {ccy_pair} {tenor} forward.",
         }
-    
-    return {"status": "success", "message": "Trade is within desk risk limits."}
-    # Time Complexity: O(1)
+    )
+
+
+def check_limits(client_id: str, notional_usd: float, tenor: str):
+    """Very simple limit check – fail trades over 50 mm notional."""
+    if notional_usd > 50_000_000:
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason": "Notional exceeds client credit limit.",
+            }
+        )
+    return json.dumps({"status": "ok", "kyc_isda_status": "Active"})
+
+
+def record_audit(trade_json: dict):
+    """Persist the trade locally *and* in Firebolt, return transaction id."""
+    tx_id = f"TXN-{int(time.time())}"
+    ts_iso = datetime.utcnow().isoformat()
+
+    # ------------------------------------------------------------------
+    # Local JSON (fallback / offline demo)
+    # ------------------------------------------------------------------
+    os.makedirs("data", exist_ok=True)
+    file_path = os.path.join("data", f"{tx_id}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(trade_json, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Firebolt persistence (trades & audit tables)
+    # ------------------------------------------------------------------
+    try:
+        execute(
+            "INSERT INTO trades (tx_id, client_id, ccy_pair, notional_usd, tenor, fwd_points, price, side, booked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                tx_id,
+                trade_json.get("client_id", "unknown"),
+                trade_json.get("ccy_pair", "USDGBP"),
+                trade_json.get("notional_usd", 0.0),
+                trade_json.get("tenor", "3M"),
+                trade_json.get("points", 0.0),
+                trade_json.get("all_in_price", 0.0),
+                trade_json.get("side", "buy"),
+                ts_iso,
+            ],
+        )
+        execute(
+            "INSERT INTO audit (ts, event_type, payload) VALUES (?, ?, ?)",
+            [ts_iso, "trade_booked", json.dumps(trade_json)],
+        )
+    except Exception as exc:
+        print(f"Firebolt insert failed (trades/audit): {exc}")
+
+    return json.dumps({"status": "booked", "transaction_id": tx_id})

@@ -1,153 +1,267 @@
-
-# ADD THESE TWO LINES AT THE VERY TOP
-from dotenv import load_dotenv
-load_dotenv()
-# ------------------------------------
-
-# agent.py
-import os
-import json
-import anthropic
-import tools 
-from inspect import signature, getdoc
-from typing import Dict, Any
-
-# --- Initialization ---
-try:
-    client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-except KeyError:
-    print("FATAL: ANTHROPIC_API_KEY environment variable not set. Please set it to continue.")
-    exit()
-
-# --- Tool & Prompt Definition ---
-
-AVAILABLE_TOOLS = {
-    "get_market_data": tools.get_market_data,
-    "check_credit_limit": tools.check_credit_limit,
-    "check_trading_risk": tools.check_trading_risk,
-    "get_desk_axe": tools.get_desk_axe,
-    "record_trade_and_notify": tools.record_trade_and_notify,
-}
-
-SYSTEM_PROMPT = """
-You are Synapse, an AI trading co-pilot. Your personality is professional, concise, and direct. Your mission is to assist a human trader to quote, negotiate, and book a plain-vanilla USD/GBP 3-month FX forward.
-
-You MUST use the provided tools to follow this exact workflow:
-
-1.  **On a quote request:** You MUST perform all pre-trade checks first. This involves calling `check_credit_limit` for counterparty risk and `check_trading_risk` for internal desk risk. You must also call `get_desk_axe` to understand the desk's strategy.
-2.  **Synthesize and Price:** After gathering pre-trade data, you MUST call `get_market_data` to get the mid-market price. Then, using all the pre-trade information, you will apply a strategic spread to the mid-market price to generate a final quote for the client. Briefly state your reasoning for the spread.
-3.  **Negotiation:** The user may ask you to improve the price. You have the authority to improve the price once by a small, reasonable amount.
-4.  **Booking:** When the user confirms the trade (e.g., "done", "book it"), you MUST call `record_trade_and_notify` to finalize the transaction, passing the final client, notional, and price.
-5.  **Confirmation:** Provide a clear, final confirmation message including the transaction ID returned by the tool.
+"""
+AI agent implementation for Synapse Trader.
+Handles communication with Anthropic Claude and orchestrates tool usage.
 """
 
-# --- Core Agent Logic ---
+from __future__ import annotations
 
-def create_tool_spec(func) -> Dict[str, Any]:
-    """Creates a JSON tool specification from a Python function."""
-    sig = signature(func)
-    doc = getdoc(func)
-    
-    # A simple mapping from Python types to JSON schema types
-    type_mapping = {str: "string", int: "number", float: "number", dict: "object"}
+import json
+import os
+import re
+from typing import List, Dict, Any
 
-    params = {
-        name: {"type": type_mapping.get(param.annotation, "string")}
-        for name, param in sig.parameters.items()
-    }
-    
-    return {
-        "name": func.__name__,
-        "description": doc.split('Args:')[0].strip() if doc else "",
-        "input_schema": {
-            "type": "object",
-            "properties": params,
-            "required": list(params.keys())
+from dotenv import load_dotenv
+import anthropic
+
+# Load env vars early so they are available during module import
+load_dotenv()
+
+from tools import (
+    price_fx_forward,
+    check_limits,
+    record_audit,
+    log_audit_event,
+)
+
+# ---------------------------------------------------------------------------
+# ACI.dev setup
+# ---------------------------------------------------------------------------
+from aci import ACI, to_json_schema  # type: ignore
+from aci.types.enums import FunctionDefinitionFormat
+
+ACI_API_KEY = os.getenv("ACI_API_KEY")
+if not ACI_API_KEY:
+    raise RuntimeError("ACI_API_KEY missing in environment")
+
+aci = ACI(api_key=ACI_API_KEY)
+
+# ---------------------------------------------------------------------------
+# ACI-compatible tool schemas for our local Python functions
+# ---------------------------------------------------------------------------
+CUSTOM_TOOL_SCHEMAS = [
+    {
+        "type": "custom",
+        "function": {
+            "name": "price_fx_forward",
+            "description": "Return FX-forward price & forward points",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ccy_pair": {"type": "string", "description": "Currency pair (e.g. 'GBPUSD')"},
+                    "spot_rate": {"type": "number", "description": "Current spot FX rate"},
+                    "usd_rate": {"type": "number", "description": "3-month USD interest rate"},
+                    "gbp_rate": {"type": "number", "description": "3-month GBP interest rate"}
+                },
+                "required": ["ccy_pair", "spot_rate", "usd_rate", "gbp_rate"]
+            }
+        }
+    },
+    {
+        "type": "custom",
+        "function": {
+            "name": "check_limits",
+            "description": "Check client credit limits",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "string", "description": "Client identifier"},
+                    "notional_usd": {"type": "number", "description": "Trade size in USD"}
+                },
+                "required": ["client_id", "notional_usd"]
+            }
+        }
+    },
+    {
+        "type": "custom",
+        "function": {
+            "name": "record_audit",
+            "description": "Book trade and return transaction id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "trade_json": {
+                        "type": "object",
+                        "description": "Complete trade details as JSON"
+                    }
+                },
+                "required": ["trade_json"]
+            }
         }
     }
+]
 
-tools_spec = [create_tool_spec(func) for func in AVAILABLE_TOOLS.values()]
 
-def run_conversation_turn(history: list) -> list:
-    """Runs one turn of the conversation, including multi-step tool use."""
-    print(f"\nUser: {history[-1]['content']}")
+# ---------------------------------------------------------------------------
+# Anthropic client initialisation
+# ---------------------------------------------------------------------------
 
-    # Initial call to Claude
-    message = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=4096,
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY not found in environment. Did you set up your .env file?")
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ---------------------------------------------------------------------------
+# System prompt – this controls the behaviour of the agent.
+# Keep it concise for now; refine during demo iterations.
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = (
+    """You are SynapseTrader – a voice-enabled co-pilot for FX forward traders. \n"
+    "You know about:\n        • USD/GBP 3-month FX forwards (and you only handle this product).\n"
+    "Mission: quote, negotiate and book trades in a compliant manner.\n"
+    "You have access to these tools:\n"
+    "1. price_fx_forward – returns all-in forward price and forward points.\n"
+    "   Signature: {\"name\": \"price_fx_forward\", \"args\": {\"ccy_pair\": \"USDGBP\", \"notional_usd\": 25000000, \"tenor\": \"3M\"}}\n"
+    "2. check_limits – verifies client limits.\n"
+    "   Signature: {\"name\": \"check_limits\", \"args\": {\"client_id\": \"ClientCorp\", \"notional_usd\": 25000000, \"tenor\": \"3M\"}}\n"
+    "3. record_audit – books the trade and stores it.\n"
+    "   Signature: {\"name\": \"record_audit\", \"args\": {\"trade_json\": {…}}}\n\n"
+    "When you need one of these tools, respond ONLY with a JSON block inside \n"
+    "triple-backtick fences (```json … ```). The JSON must have the keys \"name\" and \"args\". \n"
+    "After you receive the <tool_result>, decide whether another tool call is \n"
+    "needed or respond normally to the trader. Do not reference implementation details."""
+)
+
+# ---------------------------------------------------------------------------
+# Tool mapping
+# ---------------------------------------------------------------------------
+
+TOOL_MAP = {
+    "price_fx_forward": price_fx_forward,
+    "check_limits": check_limits,
+    "record_audit": record_audit,
+}
+
+# ---------------------------------------------------------------------------
+# In-memory conversation history – this is reset on app restart.
+# Streamlit keeps the agent module loaded across reruns, which is fine for the
+# simple hackathon demo.
+# ---------------------------------------------------------------------------
+
+conversation_history: List[Dict[str, Any]] = []
+
+
+# ---------------------------------------------------------------------------
+# Conversation handling via ACI.dev – no manual function parsing needed
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+def _claude_chat() -> str:  # type: ignore[override]
+    response = client.messages.create(
+        model="claude-3-haiku-20240307",
         system=SYSTEM_PROMPT,
-        messages=history,
-        tools=tools_spec,
-        tool_choice={"type": "auto"}
+        max_tokens=1024,
+        messages=conversation_history,
+        tools=CUSTOM_TOOL_SCHEMAS,
     )
-    history.append({"role": message.role, "content": message.content})
-
-    # This loop handles chains of tool calls
-    while message.stop_reason == "tool_use":
-        tool_calls = [block for block in message.content if block.type == 'tool_use']
-        
-        tool_outputs = []
-        for tool_call in tool_calls:
-            tool_name = tool_call.name
-            tool_input = tool_call.input
-            tool_id = tool_call.id
-            print(f"[AGENT] Calling Tool: `{tool_name}` with input `{tool_input}`")
-
-            if tool_name in AVAILABLE_TOOLS:
-                function_to_call = AVAILABLE_TOOLS[tool_name]
-                try:
-                    output = function_to_call(**tool_input)
-                    tool_outputs.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": json.dumps(output)
-                    })
-                except Exception as e:
-                    print(f"[AGENT] ERROR calling tool: {e}")
-                    tool_outputs.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": json.dumps({"status": "error", "message": str(e)})
-                    })
-        
-        # Append all tool results to the history
-        history.append({"role": "user", "content": tool_outputs})
-
-        # Make a second call to Claude with the tool results
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=history,
-            tools=tools_spec,
-            tool_choice={"type": "auto"}
-        )
-        history.append({"role": message.role, "content": message.content})
-        
-    return history
+    return response.content[0].text
 
 
-# --- Command-Line Test Block ---
-if __name__ == "__main__":
-    print("--- Starting Synapse Trader Demo ---")
-    
-    conversation_history = []
+# ---------------------------------------------------------------------------
+# Conversation turn with tool execution
+# ---------------------------------------------------------------------------
 
-    # --- Turn 1: User asks for a quote ---
-    user_message_1 = "Can I get a quote on 25 million dollar-sterling for 3 months for ClientCorp?"
-    conversation_history.append({"role": "user", "content": user_message_1})
-    conversation_history = run_conversation_turn(conversation_history)
+def _execute_tool_from_response(response_text: str) -> str | None:
+    """If the assistant asked for a tool, execute it and return its result."""
+    match = re.search(r"```json\s*(.*?)\s*```", response_text, re.DOTALL)
+    if not match:
+        return None
 
-    final_response = next((block.text for block in conversation_history[-1]['content'] if hasattr(block, 'text')), "No text response found.")
-    print(f"Synapse: {final_response}")
+    try:
+        tool_call = json.loads(match.group(1))
+        tool_name: str = tool_call["name"]
+        tool_args: Dict[str, Any] = tool_call.get("args", {})
+    except (json.JSONDecodeError, KeyError) as err:
+        return f"Error decoding tool request: {err}"
 
-    # --- Turn 2: User books the trade ---
-    user_message_2 = "Looks good. Done, book it."
-    conversation_history.append({"role": "user", "content": user_message_2})
-    conversation_history = run_conversation_turn(conversation_history)
-    
-    final_response = next((block.text for block in conversation_history[-1]['content'] if hasattr(block, 'text')), "No text response found.")
-    print(f"Synapse: {final_response}")
+    tool_func = TOOL_MAP.get(tool_name)
+    if tool_func is None:
+        return f"Unknown tool requested: {tool_name}"
 
-    print("\n--- Demo Finished ---")
+    try:
+        tool_result = tool_func(**tool_args)
+    except Exception as exc:
+        tool_result = json.dumps({"status": "error", "error": str(exc)})
+
+    return tool_result
+
+
+def run_conversation_turn(user_message: str) -> str:
+    """Handle one full turn including potential tool calls."""
+
+    # 1. Append user message
+    conversation_history.append({"role": "user", "content": user_message})
+
+    # 2. First response from Claude
+    assistant_response = _claude_chat()
+
+    # 3. Check if a tool call is embedded
+    tool_result = _execute_tool_from_response(assistant_response)
+    if tool_result is None:
+        # No tool needed – conversation turn finished.
+        conversation_history.append({"role": "assistant", "content": assistant_response})
+        return assistant_response.strip()
+
+    # 4. Add assistant response + tool result to history
+    conversation_history.append({"role": "assistant", "content": assistant_response})
+    conversation_history.append({"role": "user", "content": f"<tool_result>\n{tool_result}\n</tool_result>"})
+
+    # 5. Ask Claude to incorporate the tool result
+    final_response = _claude_chat()
+
+    conversation_history.append({"role": "assistant", "content": final_response})
+
+    return final_response.strip()
+
+
+# ---------------------------------------------------------------------------
+# Public entry point used by the Streamlit front-end
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# New simpler run_conversation_turn using ACI
+# ---------------------------------------------------------------------------
+
+def run_conversation_turn(user_message: str) -> str:  # type: ignore[override]
+    """Single chat turn – ACI handles function calling automatically."""
+    conversation_history.append({"role": "user", "content": user_message})
+
+    # --- get initial assistant response from Claude ---
+    assistant_response = _claude_chat()
+
+    # look for ```json tool call```
+    match = re.search(r"```json\s*(.*?)\s*```", assistant_response, re.DOTALL)
+    if not match:
+        conversation_history.append({"role": "assistant", "content": assistant_response})
+        return assistant_response.strip()
+
+    tool_json = json.loads(match.group(1))
+    tool_name = tool_json["name"]
+    tool_args = tool_json.get("args", {})
+
+    try:
+        tool_result = aci.handle_function_call(tool_name, tool_args)
+    except Exception as exc:
+        tool_result = json.dumps({"status": "error", "error": str(exc)})
+
+    # add both assistant response & tool result to history and ask Claude again
+    conversation_history.append({"role": "assistant", "content": assistant_response})
+    conversation_history.append({"role": "user", "content": f"<tool_result>\n{tool_result}\n</tool_result>"})
+
+    final_response = _claude_chat()
+    conversation_history.append({"role": "assistant", "content": final_response})
+    return final_response.strip()
+
+# ---------------------------------------------------------------------------
+
+def process_user_input(user_message: str) -> str:
+    """Wrapper to keep the original front-end function name."""
+    try:
+        reply = run_conversation_turn(user_message)
+        return reply
+    except Exception as exc:
+        error_msg = f"Error processing request: {exc}"
+        log_audit_event("error", {"error": error_msg})
+        return error_msg
