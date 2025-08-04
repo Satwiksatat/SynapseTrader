@@ -20,6 +20,7 @@ colorama==0.4.6
 cryptography==45.0.5
 distro==1.9.0
 elevenlabs==2.8.1
+fastapi==0.115.6
 firebolt_sdk==1.14.0
 gitdb==4.0.12
 GitPython==3.1.45
@@ -52,6 +53,7 @@ pydeck==0.9.1
 pydub==0.25.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.1
+python-multipart==0.0.20
 pytz==2025.2
 readerwriterlock==1.0.9
 referencing==0.36.2
@@ -79,4 +81,5 @@ typing-inspection==0.4.1
 typing_extensions==4.14.1
 tzdata==2025.2
 urllib3==2.5.0
+uvicorn==0.32.1
 websockets==15.0.1
