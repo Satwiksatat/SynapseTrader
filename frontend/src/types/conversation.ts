@@ -22,5 +22,5 @@ export interface ChatRequest {
 
 export interface ChatResponse {
   text: string;
-  audioUrl?: string;
+  audio_url?: string;
 } 
